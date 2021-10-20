@@ -64,6 +64,7 @@ __all__ = [
     "SteSign",
     "SteTern",
     "SwishSign",
+    "ConvBinarizer",
 ]
 
 
@@ -407,6 +408,55 @@ class SwishSign(_BaseQuantizer):
 
     def call(self, inputs):
         outputs = swish_sign(inputs, beta=self.beta)
+        return super().call(outputs)
+
+    def get_config(self):
+        return {**super().get_config(), "beta": self.beta}
+
+class SoftArgmax():
+    def __init__(self, dim, beta):
+        super(SoftArgmax, self).__init__()
+        self.dim = dim
+        self.beta = beta if beta else tf.Variable(1.0)
+    def forward(self, x):
+        x = x * self.beta
+        smax = tf.nn.softmax(x, axis=1)
+        # smax = x.softmax(self.dim)[:,1,:,:]
+        return smax
+
+@utils.register_alias("conv_binarizer")
+@utils.register_keras_custom_object
+class ConvBinarizerDepthwise(_BaseQuantizer):
+    r"""Custom ConvBinarizer
+    """
+    precision = 1
+
+    def __init__(self, in_chn, beta, **kwargs):
+        self.in_chn = in_chn
+        self.beta = beta
+        self.conv = tf.keras.layers.Conv2D(filters=in_chn*2, kernel_size=3, groups = in_chn, strides=1, padding='same')
+        self.soft_argmax = SoftArgmax(dim=1, beta=beta)
+        (self.b,self.c,self.h,self.w) = input.shape
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        @tf.function
+        def soft_argmax_grad(x):
+            return tf.gradient(tf.math.subtract(tf.math.multiply(tf.reshape(
+                self.soft_argmax(x), [self.b,self.c,self.h,self.w]), 2), 1), x)[0]
+
+        @tf.custom_gradient
+        def conv_binarizer(input):
+            x = self.conv(input)
+            chan = tf.reshape(x, [self.b*self.c, 2, self.h, self.w])
+
+            out_no_grad = tf.reshape(tf.math.argmax(chan, axis=1),[self.b,self.c,self.h,self.w])
+            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1]), tf.constant([1]))
+
+            # Use argmax in forward pass, softargmax in backward pass
+            return out_no_grad, lambda y: (y * soft_argmax_grad(chan), None)
+
+        outputs = conv_binarizer(inputs, self.conv)
         return super().call(outputs)
 
     def get_config(self):
