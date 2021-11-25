@@ -45,12 +45,13 @@ lq.layers.QuantDense(64, kernel_quantizer=lq.quantizers.SteSign(clip_value=1.0))
 ```
 """
 from typing import Callable, Union
-
+import os
 import tensorflow as tf
 
 from larq import context, math
 from larq import metrics as lq_metrics
 from larq import utils
+import numpy as np
 
 __all__ = [
     "ApproxSign",
@@ -413,55 +414,106 @@ class SwishSign(_BaseQuantizer):
     def get_config(self):
         return {**super().get_config(), "beta": self.beta}
 
-class SoftArgmax():
-    def __init__(self, dim, beta):
-        super(SoftArgmax, self).__init__()
-        self.dim = dim
-        self.beta = beta if beta else tf.Variable(1.0)
-    def forward(self, x):
-        x = x * self.beta
-        smax = tf.nn.softmax(x, axis=1)
-        # smax = x.softmax(self.dim)[:,1,:,:]
-        return smax
 
-@utils.register_alias("conv_binarizer")
+@utils.register_alias("conv_binarizer_channelwise")
+@utils.register_keras_custom_object
+class ConvBinarizerChannelwise(_BaseQuantizer):
+    r"""Custom ConvBinarizer
+    """
+    precision = 1
+
+    def __init__(self, in_chn=None, beta=None, **kwargs):
+        self.in_chn = in_chn
+        self.soft_argmax_beta = beta if beta else tf.Variable(1.0, name="soft_argmax_beta"+str(tf.keras.backend.get_uid("soft_argmax_beta")))
+        self.conv = tf.keras.layers.Conv2D(filters=2, kernel_size=3, strides=1, padding='same', data_format="channels_first")
+        self.softmax = tf.nn.softmax
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        _, self.h, self.w, self.c = inputs.shape
+
+        # def sinsoftargmax(x):
+        # # def softmax_torch(x): # Assuming x has atleast 2 dimensions
+        #     # maxes = torch.max(x, 1, keepdim=True)[0]
+        #     x_exp = tf.math.exp(tf.math.sin(x))
+        #     x_exp_sum = tf.math.reduce_sum(x_exp, 1, keepdims=True)
+        #     probs = (x_exp/x_exp_sum)[:,:,:,1]
+        #     out = tf.math.subtract(tf.math.multiply(tf.reshape(probs, [-1,self.h,self.w,self.c]),2),1)
+        #     return out
+
+        @tf.function
+        def softargmax(x):
+            x = x * self.soft_argmax_beta
+            # smax = tf.exp(x[:,1,:,:]) / tf.reduce_sum(tf.exp(x), 1)
+            x = self.softmax(x, axis=1)[:,1,:,:]
+            x = tf.reshape(x, [-1,self.c,self.h,self.w])
+            x = tf.math.subtract(tf.math.multiply(x,2),1)
+            return x
+
+        @tf.function
+        def conv_binarizer(x):
+            x_t = tf.transpose(x, [0,3,1,2]) # convert nhwc to nchw
+            x_t = tf.reshape(x_t, [-1, 1, self.h, self.w])
+            x_t = self.conv(x_t)
+            
+            out_no_grad = tf.math.argmax(x_t, axis=1)
+            out_no_grad = tf.reshape(out_no_grad ,[-1, self.c, self.h, self.w])
+            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
+            out_grad = softargmax(x_t)
+
+
+            out_grad = tf.transpose(out_grad, [0,2,3,1])
+            out_no_grad = tf.transpose(out_no_grad, [0,2,3,1])
+            return out_grad + out_no_grad - tf.stop_gradient(out_grad)
+        outputs = conv_binarizer(inputs)
+        # with file_writer.as_default():
+        #     tf.summary.image("input", inputs[:,:,:,0:1], step=0)
+        #     tf.summary.image("output", outputs[:,:,:,0:1], step=0)
+        return super().call(outputs)
+
+    def get_config(self):
+        return {**super().get_config(), "soft_argmax_beta": self.soft_argmax_beta.numpy()}
+
+
+@utils.register_alias("conv_binarizer_depthwise")
 @utils.register_keras_custom_object
 class ConvBinarizerDepthwise(_BaseQuantizer):
     r"""Custom ConvBinarizer
     """
     precision = 1
 
-    def __init__(self, in_chn, beta, **kwargs):
-        self.in_chn = in_chn
-        self.beta = beta
-        self.conv = tf.keras.layers.Conv2D(filters=in_chn*2, kernel_size=3, groups = in_chn, strides=1, padding='same')
-        self.soft_argmax = SoftArgmax(dim=1, beta=beta)
-        (self.b,self.c,self.h,self.w) = input.shape
-        super().__init__(**kwargs)
+    def __init__(self, beta=None, name="convbin_depthwise", **kwargs):
+        super().__init__(name=name+str(tf.keras.backend.get_uid(name)), **kwargs)
+        # self.beta = beta if beta else tf.Variable(1.0)
+        self.soft_argmax_beta = beta if beta else tf.Variable(1.0, name="soft_argmax_beta"+str(tf.keras.backend.get_uid("soft_argmax_beta")))
+
+
+    def build(self, input_shape):
+        self.conv = tf.keras.layers.Conv2D(filters=input_shape[-1]*2, groups=input_shape[-1], kernel_size=3, strides=1, padding='same')
+        self.softmax = tf.nn.softmax
+        _, self.h, self.w, self.c = input_shape
 
     def call(self, inputs):
-        @tf.function
-        def soft_argmax_grad(x):
-            return tf.gradient(tf.math.subtract(tf.math.multiply(tf.reshape(
-                self.soft_argmax(x), [self.b,self.c,self.h,self.w]), 2), 1), x)[0]
+        x = self.conv(inputs) 
+        x = tf.transpose(x, [0,3,1,2]) # convert nhwc to nchw
+        x = tf.reshape(x, [-1, 2, self.h, self.w])
+        out_no_grad = tf.reshape(tf.math.argmax(x, axis=1),[-1,  self.c, self.h, self.w])
+        out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
 
-        @tf.custom_gradient
-        def conv_binarizer(input):
-            x = self.conv(input)
-            chan = tf.reshape(x, [self.b*self.c, 2, self.h, self.w])
+        x = x * self.soft_argmax_beta
+        # max_x = tf.math.reduce_max(x)
+        # x = tf.exp(x[:,1,:,:]-max_x) / tf.reduce_sum(tf.exp(x-max_x), 1)
+        x = self.softmax(x, axis=1)[:,1,:,:]
+        x = tf.reshape(x, [-1,self.c,self.h,self.w])
+        out_grad = tf.math.subtract(tf.math.multiply(x,2),1)
 
-            out_no_grad = tf.reshape(tf.math.argmax(chan, axis=1),[self.b,self.c,self.h,self.w])
-            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1]), tf.constant([1]))
-
-            # Use argmax in forward pass, softargmax in backward pass
-            return out_no_grad, lambda y: (y * soft_argmax_grad(chan), None)
-
-        outputs = conv_binarizer(inputs, self.conv)
-        return super().call(outputs)
+        out_no_grad = tf.transpose(out_no_grad, [0,2,3,1])
+        out_grad = tf.transpose(out_grad, [0,2,3,1])
+        return out_grad + tf.stop_gradient(out_no_grad - out_grad)
+        # return super().call(outputs)
 
     def get_config(self):
-        return {**super().get_config(), "beta": self.beta}
-
+        return {**super().get_config(), "soft_argmax_beta": self.soft_argmax_beta.numpy()}
 
 @utils.register_alias("magnitude_aware_sign")
 @utils.register_keras_custom_object
