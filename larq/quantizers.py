@@ -53,6 +53,10 @@ from larq import metrics as lq_metrics
 from larq import utils
 import numpy as np
 
+
+# logdir = os.path.join(os.getcwd(), "debug2")
+# file_writer = tf.summary.create_file_writer(logdir)
+
 __all__ = [
     "ApproxSign",
     "DoReFa",
@@ -148,7 +152,6 @@ def ste_heaviside(x: tf.Tensor, clip_value: float = 1.0) -> tf.Tensor:
         return math.heaviside(x), grad
 
     return _call(x)
-
 
 class Quantizer(tf.keras.layers.Layer):
     """Common base class for defining quantizers.
@@ -486,31 +489,67 @@ class ConvBinarizerDepthwise(_BaseQuantizer):
         super().__init__(name=name+str(tf.keras.backend.get_uid(name)), **kwargs)
         # self.beta = beta if beta else tf.Variable(1.0)
         self.soft_argmax_beta = beta if beta else tf.Variable(1.0, name="soft_argmax_beta"+str(tf.keras.backend.get_uid("soft_argmax_beta")))
+        # self.soft_argmax_beta = 1.0
 
 
     def build(self, input_shape):
-        self.conv = tf.keras.layers.Conv2D(filters=input_shape[-1]*2, groups=input_shape[-1], kernel_size=3, strides=1, padding='same')
-        self.softmax = tf.nn.softmax
-        _, self.h, self.w, self.c = input_shape
+        self.conv = tf.keras.layers.DepthwiseConv2D(kernel_size=3, strides=1, padding='same', depth_multiplier=2)
+        self.n, self.h, self.w, self.c = input_shape
+        
 
     def call(self, inputs):
+        @tf.custom_gradient
+        def soft_argmax(x):
+            out_no_grad = tf.argmax(x, axis=3)  
+            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
+
+            @tf.function
+            def argmax_soft(x):
+                out = tf.nn.softmax(x, axis=3)[:,:,:,1,:]
+                return tf.math.subtract(tf.math.multiply(out,2),1)
+
+            def grad(dy):
+                # tf.print(tf.shape(dy))
+                gradient = tf.gradients(argmax_soft(x), x)[0] 
+                gradient = gradient * tf.expand_dims(dy, axis=3)
+                return gradient
+            return out_no_grad, grad
+
+
         x = self.conv(inputs) 
-        x = tf.transpose(x, [0,3,1,2]) # convert nhwc to nchw
-        x = tf.reshape(x, [-1, 2, self.h, self.w])
-        out_no_grad = tf.reshape(tf.math.argmax(x, axis=1),[-1,  self.c, self.h, self.w])
-        out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
-
+        # x = tf.transpose(x, [0,3,1,2]) # convert nhwc to nchw
+        x = tf.reshape(x, [-1, self.h, self.w, 2, self.c])
         x = x * self.soft_argmax_beta
-        # max_x = tf.math.reduce_max(x)
-        # x = tf.exp(x[:,1,:,:]-max_x) / tf.reduce_sum(tf.exp(x-max_x), 1)
-        x = self.softmax(x, axis=1)[:,1,:,:]
-        x = tf.reshape(x, [-1,self.c,self.h,self.w])
-        out_grad = tf.math.subtract(tf.math.multiply(x,2),1)
+        outputs = soft_argmax(x)
 
-        out_no_grad = tf.transpose(out_no_grad, [0,2,3,1])
-        out_grad = tf.transpose(out_grad, [0,2,3,1])
-        return out_grad + tf.stop_gradient(out_no_grad - out_grad)
-        # return super().call(outputs)
+
+    # def call(self, inputs):
+    #     @tf.custom_gradient
+    #     def soft_argmax(x):
+    #         out_no_grad = tf.expand_dims(tf.argmax(x, axis=1), axis=1)  
+    #         out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
+
+    #         @tf.function
+    #         def argmax_soft(x):
+    #             out = tf.nn.softmax(x, axis=1)[:,1,:,:]
+    #             return tf.math.subtract(tf.math.multiply(out,2),1)
+
+    #         def grad(dy):
+    #             gradient = tf.gradients(argmax_soft(x), x)[0] 
+    #             gradient = gradient * dy
+    #             return gradient
+    #         return out_no_grad, grad
+
+
+    #     x = self.conv(inputs) 
+    #     x = tf.transpose(x, [0,3,1,2]) # convert nhwc to nchw
+    #     x = tf.reshape(x, [-1, 2, self.h, self.w])
+    #     x = x * self.soft_argmax_beta
+    #     x = soft_argmax(x)
+    #     x = tf.reshape(x, [-1,self.c,self.h,self.w])
+    #     outputs = tf.transpose(x, [0,2,3,1])
+
+        return super().call(outputs)
 
     def get_config(self):
         return {**super().get_config(), "soft_argmax_beta": self.soft_argmax_beta.numpy()}
