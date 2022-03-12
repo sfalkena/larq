@@ -45,7 +45,7 @@ lq.layers.QuantDense(64, kernel_quantizer=lq.quantizers.SteSign(clip_value=1.0))
 ```
 """
 from typing import Callable, Union
-
+import os
 import tensorflow as tf
 
 from larq import context, math
@@ -148,7 +148,6 @@ def ste_heaviside(x: tf.Tensor, clip_value: float = 1.0) -> tf.Tensor:
         return math.heaviside(x), grad
 
     return _call(x)
-
 
 class Quantizer(tf.keras.layers.Layer):
     """Common base class for defining quantizers.
