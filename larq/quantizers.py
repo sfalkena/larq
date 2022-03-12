@@ -51,6 +51,7 @@ import tensorflow as tf
 from larq import context, math
 from larq import metrics as lq_metrics
 from larq import utils
+from larq import layers
 
 __all__ = [
     "ApproxSign",
@@ -64,7 +65,7 @@ __all__ = [
     "SteSign",
     "SteTern",
     "SwishSign",
-    "ConvBinarizer",
+    "LAB"
 ]
 
 
@@ -268,7 +269,7 @@ class SteSign(_BaseQuantizer):
 
     def __init__(self, clip_value: float = 1.0, **kwargs):
         self.clip_value = clip_value
-        super().__init__(**kwargs)
+        super().__init__(name="ste_sign"+str(tf.keras.backend.get_uid("ste_sign")), **kwargs)
 
     def call(self, inputs):
         outputs = ste_sign(inputs, clip_value=self.clip_value)
@@ -413,56 +414,62 @@ class SwishSign(_BaseQuantizer):
     def get_config(self):
         return {**super().get_config(), "beta": self.beta}
 
-class SoftArgmax():
-    def __init__(self, dim, beta):
-        super(SoftArgmax, self).__init__()
-        self.dim = dim
-        self.beta = beta if beta else tf.Variable(1.0)
-    def forward(self, x):
-        x = x * self.beta
-        smax = tf.nn.softmax(x, axis=1)
-        # smax = x.softmax(self.dim)[:,1,:,:]
-        return smax
-
-@utils.register_alias("conv_binarizer")
+@utils.register_alias("LAB")
 @utils.register_keras_custom_object
-class ConvBinarizerDepthwise(_BaseQuantizer):
-    r"""Custom ConvBinarizer
+class LAB(_BaseQuantizer):
+    r"""Custom LAB binarization function as proposed in the paper: 
+    "LAB: Learnable Activation Binarizer for Binary Neural Networks"
+    
+    args:
+        beta (float):   Value of beta if beta is desired static. If no value is supplied, 
+                        beta will be initialized to 1 and learned.
+        name (str):     Custom name in the graph.
     """
     precision = 1
 
-    def __init__(self, in_chn, beta, **kwargs):
-        self.in_chn = in_chn
-        self.beta = beta
-        self.conv = tf.keras.layers.Conv2D(filters=in_chn*2, kernel_size=3, groups = in_chn, strides=1, padding='same')
-        self.soft_argmax = SoftArgmax(dim=1, beta=beta)
-        (self.b,self.c,self.h,self.w) = input.shape
-        super().__init__(**kwargs)
+    def __init__(self, beta=None, name="convbin_depthwise", **kwargs):
+        super().__init__(name=name+str(tf.keras.backend.get_uid(name)), **kwargs)
+        uid = "soft_argmax_beta"+str(tf.keras.backend.get_uid("soft_argmax_beta"))
+        self.soft_argmax_beta = beta if beta else tf.Variable(1.0, name=uid)
+
+    def build(self, input_shape):
+        self.conv = layers.QuantDepthwiseConv2D(kernel_size=3, 
+                                                strides=1, 
+                                                padding='same', 
+                                                depth_multiplier=2,
+                                                depthwise_quantizer=NoOp(precision=1))
+        self.n, self.h, self.w, self.c = input_shape
+        
 
     def call(self, inputs):
-        @tf.function
-        def soft_argmax_grad(x):
-            return tf.gradient(tf.math.subtract(tf.math.multiply(tf.reshape(
-                self.soft_argmax(x), [self.b,self.c,self.h,self.w]), 2), 1), x)[0]
-
         @tf.custom_gradient
-        def conv_binarizer(input):
-            x = self.conv(input)
-            chan = tf.reshape(x, [self.b*self.c, 2, self.h, self.w])
+        def soft_argmax(x):
+            out_no_grad = tf.argmax(x, axis=3)  
+            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1.0]), tf.constant([1.0]))
 
-            out_no_grad = tf.reshape(tf.math.argmax(chan, axis=1),[self.b,self.c,self.h,self.w])
-            out_no_grad = tf.where(out_no_grad==0, tf.constant([-1]), tf.constant([1]))
+            @tf.function
+            def argmax_soft(x):
+                out = tf.nn.softmax(x, axis=3)[:,:,:,1,:]
+                return tf.math.subtract(tf.math.multiply(out,2),1)
 
-            # Use argmax in forward pass, softargmax in backward pass
-            return out_no_grad, lambda y: (y * soft_argmax_grad(chan), None)
+            def grad(dy):
+                gradient = tf.gradients(argmax_soft(x), x)[0] 
+                gradient = gradient * tf.expand_dims(dy, axis=3)
+                return gradient
+            return out_no_grad, grad
 
-        outputs = conv_binarizer(inputs, self.conv)
+
+        x = self.conv(inputs) 
+        x = tf.reshape(x, [-1, self.h, self.w, 2, self.c])
+        x = x * self.soft_argmax_beta
+        outputs = soft_argmax(x)
+
         return super().call(outputs)
 
     def get_config(self):
-        return {**super().get_config(), "beta": self.beta}
-
-
+        return {**super().get_config(), "soft_argmax_beta": self.soft_argmax_beta.numpy()}
+    
+    
 @utils.register_alias("magnitude_aware_sign")
 @utils.register_keras_custom_object
 class MagnitudeAwareSign(_BaseQuantizer):

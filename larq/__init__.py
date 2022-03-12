@@ -10,6 +10,7 @@ from larq import (
     optimizers,
     quantizers,
     utils,
+    sauvola,
 )
 
 try:
@@ -32,4 +33,5 @@ __all__ = [
     "quantizers",
     "optimizers",
     "utils",
+    "sauvola",
 ]
