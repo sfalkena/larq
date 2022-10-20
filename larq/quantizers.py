@@ -66,6 +66,7 @@ __all__ = [
     "SteTern",
     "SwishSign",
     "LAB",
+    "Niblack",
     "Sauvola"
 ]
 
@@ -468,8 +469,41 @@ class LAB(_BaseQuantizer):
 
     def get_config(self):
         return {**super().get_config(), "soft_argmax_beta": self.soft_argmax_beta.numpy()}
+
+
+@utils.register_alias("Niblack")
+@utils.register_keras_custom_object
+class Niblack(_BaseQuantizer):
+    r"""
+    """
+    precision = 1
+
+    def __init__(self, name="niblack", **kwargs):
+        super().__init__(name=name+str(tf.keras.backend.get_uid(name)), **kwargs)
+
+    def build(self, input_shape):
+        self.b, self.h, self.w, self.c = input_shape
+        self.n=3 
+        self.k=-0.2
+        self.mean = tf.keras.layers.AveragePooling2D(self.n, strides=1, padding="same")
+
+        self.sign = SteSign()
+
+    def call(self, inputs):
+        
+        epsilon = 1e-9
+        mn = self.mean(inputs)
+        std = tf.math.sqrt(self.mean(tf.math.square(tf.math.abs(inputs - mn)))+epsilon)
+        
+        # Calculate the threshold value 
+        th = mn + self.k * std
+        outputs = self.sign(inputs - th)
+        return super().call(outputs)
+
+    def get_config(self):
+        return {**super().get_config()}
     
-import numpy as np
+       
 @utils.register_alias("Sauvola")
 @utils.register_keras_custom_object
 class Sauvola(_BaseQuantizer):
@@ -483,8 +517,7 @@ class Sauvola(_BaseQuantizer):
     def build(self, input_shape):
         self.b, self.h, self.w, self.c = input_shape
         self.n=3 
-        # self.R=50.0
-        self.k=0.2
+        self.k=0.5
         self.mean = tf.keras.layers.AveragePooling2D(self.n, strides=1, padding="same")
 
         self.sign = SteSign()
@@ -493,15 +526,11 @@ class Sauvola(_BaseQuantizer):
         
         epsilon = 1e-9
         mn = self.mean(inputs)
-        # tf.print(tf.math.reduce_max(mn))
         std = tf.math.sqrt(self.mean(tf.math.square(tf.math.abs(inputs - mn)))+epsilon)
         self.R = tf.math.reduce_max(tf.math.abs(std))
-        # tf.print(self.R)
         
-              
-        # Calculate the threshold value (Eq.5)
+        # Calculate the threshold value 
         th = mn * (1.0 + self.k * ((std/(self.R+epsilon)) - 1.0))
-        # tf.print(tf.math.reduce_min(th),tf.math.reduce_max(th))
         outputs = self.sign(inputs - th)
         return super().call(outputs)
 
